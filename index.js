@@ -1346,7 +1346,13 @@ function isCommandLikeText(line) {
   if (/^\s*(if|for|while|case|then|fi)\b/.test(lower)) return true;
   if (/^\s*(echo|printf|cat|grep|sed|awk|jq|ls|cd|pwd|mkdir|rm|cp|mv|git|npm|node|bash|sh)\b/.test(lower)) return true;
   if (/^[A-Z_][A-Z0-9_]*=/.test(raw)) return true;
+  if (/[a-z0-9_-]+\.(js|mjs|ts|sh|json)\b/i.test(raw)) return true;
   if (lower.includes("/dev/null")) return true;
+  if (lower.includes("cli args")) return true;
+  if (lower.includes("openclaw dir")) return true;
+  if (lower.includes("totaltokens")) return true;
+  if (lower.includes("harness.mjs")) return true;
+  if (lower.includes("feature/plugin")) return true;
   if (/[;&|]{1,2}/.test(raw)) return true;
   if (raw.includes("$(") || raw.includes("${")) return true;
   if (/(^|[\s"'`])\/home\/|(^|[\s"'`])~\//.test(raw)) return true;
