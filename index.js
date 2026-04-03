@@ -765,6 +765,16 @@ function normalizeNoisyTitle(rawTitle) {
   return normalized;
 }
 
+function deriveGenericTitleFromCwd(cwd) {
+  const resolved = String(cwd || "").trim();
+  const base = path.basename(resolved || "").replace(/[-_]+/g, " ").trim();
+  const lower = `${resolved} ${base}`.toLowerCase();
+  if (lower.includes("cognitiverag")) return "CognitiveRAG maintenance run";
+  if (lower.includes("codex-bridge")) return "Codex bridge maintenance run";
+  if (base) return `Maintenance run in ${base}`;
+  return "Maintenance run";
+}
+
 function trimToWordLimit(rawTitle, maxWords = 10) {
   const text = normalizeThreadName(rawTitle || "", 120);
   if (!text) return "";
@@ -1099,26 +1109,39 @@ function listCliThreadIds(pluginConfig, limit = 20) {
     const existing = byThread.get(threadId);
     if (existing) {
       existing.files.push(item.file);
+      existing.lastUpdatedMs = Math.max(existing.lastUpdatedMs || 0, item.mtimeMs || 0);
       continue;
     }
     byThread.set(threadId, {
       threadId,
       timestamp: parsed?.payload?.timestamp || parsed?.timestamp || null,
       cwd: parsed?.payload?.cwd || null,
+      lastUpdatedMs: item.mtimeMs || 0,
       files: [item.file],
     });
   }
 
   for (const row of byThread.values()) {
+    const computedName = extractThreadSummaryFromSessionFiles(row.files);
+    const normalizedName = normalizeAutoThreadTitle(computedName);
+    const defaultName =
+      scoreTitleQuality(normalizedName) < 8 ||
+      isMetaNamingPrompt(normalizedName) ||
+      isCommandLikeText(normalizedName)
+        ? deriveGenericTitleFromCwd(row.cwd)
+        : normalizedName;
     rows.push({
       threadId: row.threadId,
-      timestamp: row.timestamp,
+      timestamp: row.lastUpdatedMs ? new Date(row.lastUpdatedMs).toISOString() : row.timestamp,
+      lastUpdatedAt: row.lastUpdatedMs ? new Date(row.lastUpdatedMs).toISOString() : row.timestamp,
+      lastUpdatedMs: row.lastUpdatedMs || 0,
       cwd: row.cwd,
-      defaultName: extractThreadSummaryFromSessionFiles(row.files),
+      defaultName,
       file: row.files[0],
     });
-    if (rows.length >= limit) break;
   }
+  rows.sort((a, b) => Number(b.lastUpdatedMs || 0) - Number(a.lastUpdatedMs || 0));
+  if (rows.length > limit) rows.length = limit;
   return { sessionsDir, rows };
 }
 
@@ -1327,6 +1350,7 @@ function isCommandLikeText(line) {
   if (/[;&|]{1,2}/.test(raw)) return true;
   if (raw.includes("$(") || raw.includes("${")) return true;
   if (/(^|[\s"'`])\/home\/|(^|[\s"'`])~\//.test(raw)) return true;
+  if (/\b(turn aborted|openclaw dir|write probe|patch commands|read only|readonly)\b/.test(lower)) return true;
   return false;
 }
 
@@ -1442,7 +1466,8 @@ function isTemplateOrBoilerplatePrompt(line) {
     lower.includes("implementation task. you may modify files") ||
     lower.includes("this is not a small patch") ||
     lower.includes("mission") ||
-    lower.includes("primary governing")
+    lower.includes("primary governing") ||
+    lower.includes("<turn aborted")
   );
 }
 
@@ -1451,7 +1476,14 @@ function buildSemanticCorpus(prompts) {
   return input
     .flatMap((text) => splitCandidateLines(text))
     .map((line) => cleanupTitle(line))
-    .filter((line) => line && !isBoilerplateLine(line) && !isTemplateOrBoilerplatePrompt(line))
+    .filter(
+      (line) =>
+        line &&
+        !isBoilerplateLine(line) &&
+        !isTemplateOrBoilerplatePrompt(line) &&
+        !isCommandLikeText(line) &&
+        !isMetaNamingPrompt(line),
+    )
     .join("\n")
     .toLowerCase();
 }
@@ -1544,8 +1576,14 @@ function deriveThreadTitleFromPrompts(prompts, maxChars = 72) {
     }
   }
   candidates.sort((a, b) => b.score - a.score);
-  const best = candidates.find((c) => c.score > 1)?.line;
-  const weaker = candidates.find((c) => c.score > -5 && !isLowSignalPrompt(c.line))?.line;
+  const best = candidates.find((c) => c.score >= 12)?.line;
+  const weaker = candidates.find(
+    (c) =>
+      c.score >= 7 &&
+      !isLowSignalPrompt(c.line) &&
+      !isCommandLikeText(c.line) &&
+      !isMetaNamingPrompt(c.line),
+  )?.line;
   const fallback = input
     .map((text) => extractHumanPromptPreview(text, maxChars))
     .find((name) => name && name !== "Unnamed session" && !isLowSignalPrompt(name));
@@ -2062,10 +2100,10 @@ export default function register(api) {
       } else {
         for (const row of rows) {
           store.recomputeThreadAutoTitle(row.threadId, row.defaultName || "Unnamed session");
-          const when = row.timestamp || "unknown-time";
+          const when = row.lastUpdatedAt || row.timestamp || "unknown-time";
           const cwd = row.cwd || "unknown-cwd";
           const displayName = store.getEffectiveThreadName(row.threadId, row.defaultName || "Unnamed session");
-          lines.push(`- ${row.threadId} | ${displayName} | ${when} | ${cwd}`);
+          lines.push(`- ${row.threadId} | ${displayName} | last-updated: ${when} | ${cwd}`);
         }
       }
       lines.push("");

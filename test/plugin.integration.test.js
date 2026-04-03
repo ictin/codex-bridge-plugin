@@ -76,6 +76,8 @@ function writeRolloutSession(
     },
   });
   fs.writeFileSync(filePath, `${first}\n${second}\n`);
+  const tsMs = Number.isNaN(Date.parse(timestamp)) ? Date.now() : Date.parse(timestamp);
+  fs.utimesSync(filePath, new Date(tsMs), new Date(tsMs));
 }
 
 test("integration: bind -> run -> resume same thread -> reset -> unbind", async () => {
@@ -261,8 +263,10 @@ test("integration: codex_threadids discovers local codex CLI sessions", async ()
   assert.match(out.text, /Found: 2/);
   assert.match(out.text, /thread-A/);
   assert.match(out.text, /thread-B/);
+  assert.match(out.text, /last-updated:/);
   assert.match(out.text, /Implement Telegram codex session sharing/);
   assert.match(out.text, /Attach one: \/codex_attach/);
+  assert.ok(out.text.indexOf("thread-A") < out.text.indexOf("thread-B"));
 
   const renamed = await commands
     .get("codex_threadname")
