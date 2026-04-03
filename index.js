@@ -775,7 +775,7 @@ function deriveGenericTitleFromCwd(cwd) {
   return "Maintenance run";
 }
 
-function trimToWordLimit(rawTitle, maxWords = 10) {
+function trimToWordLimit(rawTitle, maxWords = 6) {
   const text = normalizeThreadName(rawTitle || "", 120);
   if (!text) return "";
   const safe = text
@@ -828,7 +828,7 @@ function trimToWordLimit(rawTitle, maxWords = 10) {
 function normalizeAutoThreadTitle(rawTitle) {
   const base = normalizeNoisyTitle(rawTitle || "");
   if (!base) return "";
-  return trimToWordLimit(base, 10);
+  return trimToWordLimit(base, 6);
 }
 
 function scoreTitleQuality(name) {
@@ -1122,7 +1122,8 @@ function listCliThreadIds(pluginConfig, limit = 20) {
   }
 
   for (const row of byThread.values()) {
-    const computedName = extractThreadSummaryFromSessionFiles(row.files);
+    const featureTitle = deriveFeatureTitleFromConversation(row.files, row.cwd, 6);
+    const computedName = featureTitle || extractThreadSummaryFromSessionFiles(row.files);
     const normalizedName = normalizeAutoThreadTitle(computedName);
     const defaultName =
       scoreTitleQuality(normalizedName) < 8 ||
@@ -1561,6 +1562,51 @@ function deriveSemanticLabelFromCorpus(prompts) {
     return "Codex Telegram integration";
   }
   return "";
+}
+
+function deriveFeatureTitleFromConversation(filePaths, cwd, maxWords = 6) {
+  const files = Array.isArray(filePaths) ? filePaths : [];
+  const texts = files.flatMap((file) => [
+    ...extractMessageTextsFromSession(file, "user"),
+    ...extractMessageTextsFromSession(file, "assistant"),
+  ]);
+  const corpus = texts
+    .flatMap((text) => splitCandidateLines(text))
+    .map((line) => cleanupTitle(line))
+    .filter(
+      (line) =>
+        line &&
+        !isBoilerplateLine(line) &&
+        !isTemplateOrBoilerplatePrompt(line) &&
+        !isMetaNamingPrompt(line),
+    )
+    .join(" ")
+    .toLowerCase();
+  if (!corpus.trim()) return "";
+
+  const has = (re) => re.test(corpus);
+  const hasCodex = has(/\bcodex\b|\/codex_/);
+  const hasTelegram = has(/\btelegram\b/);
+  const hasPlugin = has(/\bplugin|bridge|openclaw\b/);
+  const hasSession = has(/\bsession|thread|attach|bind|reuse|resume\b|\/codex_(attach|run|sessions|bind)\b/);
+  const hasNaming = has(/\bname|title|alias|rename\b|\/codex_threadname/);
+  const hasApproval = has(/\bapproval|approve|risky|safety|gate\b/);
+  const hasRouting = has(/\brouting|route|auto-route|skill\b/);
+  const hasInstaller = has(/\bskill installer|install skill|skills\/|codex[_ ]home\/skills\b/);
+  const hasCognitiveRag = has(/\bcognitiverag|crag\b/);
+
+  let title = "";
+  if (hasInstaller) title = "Skill installer maintenance";
+  else if (hasCognitiveRag) title = "CognitiveRAG integration fix";
+  else if (hasCodex && hasTelegram && hasPlugin && hasSession) title = "Codex Telegram session bridge";
+  else if (hasCodex && hasNaming) title = "Codex thread naming improvements";
+  else if (hasCodex && hasApproval) title = "Codex approval flow";
+  else if (hasCodex && hasRouting) title = "Codex routing improvements";
+  else if (hasCodex && hasTelegram) title = "Codex Telegram bridge work";
+  else if (isCommandLikeText(corpus)) title = deriveGenericTitleFromCwd(cwd);
+
+  if (!title) return "";
+  return trimToWordLimit(title, maxWords);
 }
 
 function deriveThreadTitleFromPrompts(prompts, maxChars = 72) {

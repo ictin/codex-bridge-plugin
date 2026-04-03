@@ -264,7 +264,7 @@ test("integration: codex_threadids discovers local codex CLI sessions", async ()
   assert.match(out.text, /thread-A/);
   assert.match(out.text, /thread-B/);
   assert.match(out.text, /last-updated:/);
-  assert.match(out.text, /Implement Telegram codex session sharing/);
+  assert.match(out.text, /Codex Telegram bridge work/);
   assert.match(out.text, /Attach one: \/codex_attach/);
   assert.ok(out.text.indexOf("thread-A") < out.text.indexOf("thread-B"));
 
@@ -392,7 +392,7 @@ test("integration: thread auto-name prefers feature intent over smoke prompts", 
   });
 
   const out = await commands.get("codex_threadids").handler(makeCtx());
-  assert.match(out.text, /Implement Telegram session sharing .*Codex threads/);
+  assert.match(out.text, /Codex Telegram bridge work/);
 });
 
 test("integration: codex_run sends telegram start progress when runtime sender is available", async () => {
@@ -614,5 +614,5 @@ test("integration: threadids title can be derived from assistant feature summary
   });
 
   const out = await commands.get("codex_threadids").handler(makeCtx());
-  assert.match(out.text, /Codex Telegram integration plugin/);
+  assert.match(out.text, /Codex Telegram session bridge/);
 });
