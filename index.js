@@ -1570,6 +1570,7 @@ function deriveFeatureTitleFromConversation(filePaths, cwd, maxWords = 6) {
     ...extractMessageTextsFromSession(file, "user"),
     ...extractMessageTextsFromSession(file, "assistant"),
   ]);
+  const rawCorpus = texts.join(" ").toLowerCase();
   const corpus = texts
     .flatMap((text) => splitCandidateLines(text))
     .map((line) => cleanupTitle(line))
@@ -1584,7 +1585,46 @@ function deriveFeatureTitleFromConversation(filePaths, cwd, maxWords = 6) {
     .toLowerCase();
   if (!corpus.trim()) return "";
 
+  const hasRaw = (re) => re.test(rawCorpus);
   const has = (re) => re.test(corpus);
+  const rawHasCodex = hasRaw(/\bcodex\b|\/codex_|codex[- ]bridge/);
+  const rawHasTelegram = hasRaw(/\btelegram\b/);
+  const rawHasPlugin = hasRaw(/\bplugin|bridge|openclaw\b/);
+  const rawHasSession = hasRaw(/\bsession|thread|attach|bind|reuse|resume|session key map\b|\/codex_(attach|run|sessions|bind)\b/);
+  const rawHasNaming = hasRaw(/\bname|title|alias|rename\b|\/codex_threadname/);
+  const rawHasApproval = hasRaw(/\bapproval|approve|risky|safety|gate|policy\b/);
+  const rawHasRouting = hasRaw(/\brouting|route|auto-route|skill\b/);
+  const rawHasInstaller = hasRaw(/\bskill installer|install skill|skills\/|codex[_ ]home\/skills\b/);
+  const rawHasCognitiveRag = hasRaw(/\bcognitiverag|crag\b/);
+  const rawHasSessionMap = hasRaw(/\bsession key map|persistent session key|conversation key map\b/);
+  const rawHasCommandPathFix = hasRaw(/\bcommand path fix|live command path fix|plugin command path\b/);
+
+  // Raw-corpus intents take priority so command-heavy threads can still get feature names.
+  if (rawHasSessionMap && rawHasCodex && rawHasPlugin) {
+    return trimToWordLimit("Codex session mapping implementation", maxWords);
+  }
+  if (rawHasCommandPathFix && rawHasCodex && rawHasPlugin) {
+    return trimToWordLimit("Codex bridge command path fix", maxWords);
+  }
+  if (rawHasCognitiveRag) {
+    return trimToWordLimit("CognitiveRAG integration fix", maxWords);
+  }
+  if (rawHasInstaller) {
+    return trimToWordLimit("Skill installer maintenance", maxWords);
+  }
+  if (rawHasCodex && rawHasTelegram && rawHasPlugin && rawHasSession) {
+    return trimToWordLimit("Codex Telegram session bridge", maxWords);
+  }
+  if (rawHasCodex && rawHasNaming) {
+    return trimToWordLimit("Codex thread naming improvements", maxWords);
+  }
+  if (rawHasCodex && rawHasApproval) {
+    return trimToWordLimit("Codex approval flow", maxWords);
+  }
+  if (rawHasCodex && rawHasRouting) {
+    return trimToWordLimit("Codex routing improvements", maxWords);
+  }
+
   const hasCodex = has(/\bcodex\b|\/codex_/);
   const hasTelegram = has(/\btelegram\b/);
   const hasPlugin = has(/\bplugin|bridge|openclaw\b/);
