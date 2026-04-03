@@ -1,0 +1,13 @@
+{
+  "name": "openclaw-codex-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test ./test/*.test.js"
+  },
+  "dependencies": {
+    "@openai/codex-sdk": "^0.118.0",
+    "better-sqlite3": "^11.10.0"
+  }
+}

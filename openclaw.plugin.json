@@ -1,0 +1,40 @@
+{
+  "id": "codex-bridge",
+  "name": "Codex Bridge",
+  "description": "Persistent Codex thread bridge for Telegram conversations",
+  "version": "0.1.0",
+  "skills": ["skills/codex-bridge"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "allowedRoots": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": []
+      },
+      "defaultModel": { "type": "string" },
+      "runTimeoutMs": {
+        "type": "integer",
+        "minimum": 10000,
+        "maximum": 3600000,
+        "default": 600000
+      },
+      "skipGitRepoCheck": {
+        "type": "boolean",
+        "default": true
+      },
+      "approval": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "riskHeuristics": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
