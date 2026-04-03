@@ -288,6 +288,7 @@ class SqliteStateStore {
         updated_at = excluded.updated_at
     `);
     this.stmtDeleteSetting = this.db.prepare(`DELETE FROM settings WHERE key = ?`);
+    this.stmtDeleteSettingsByPrefix = this.db.prepare(`DELETE FROM settings WHERE key LIKE ?`);
     this.stmtInsertRun = this.db.prepare(`
       INSERT INTO run_history (
         id, conversation_key, prompt_preview, status,
@@ -519,6 +520,13 @@ class SqliteStateStore {
   deleteSetting(key) {
     this.stmtDeleteSetting.run(String(key));
   }
+
+  deleteSettingsByPrefix(prefix) {
+    const target = String(prefix || "");
+    if (!target) return 0;
+    const result = this.stmtDeleteSettingsByPrefix.run(`${target}%`);
+    return Number(result?.changes || 0);
+  }
 }
 
 class CodexSdkAdapter {
@@ -749,6 +757,14 @@ function normalizeLowSignalTitle(rawTitle) {
   return isLowSignalPrompt(normalized) ? "Smoke/Test run" : normalized;
 }
 
+function normalizeNoisyTitle(rawTitle) {
+  const normalized = normalizeThreadName(rawTitle || "");
+  if (!normalized) return "";
+  if (isLowSignalPrompt(normalized)) return "Smoke/Test run";
+  if (isCommandLikeText(normalized)) return "Maintenance shell run";
+  return normalized;
+}
+
 function trimToWordLimit(rawTitle, maxWords = 10) {
   const text = normalizeThreadName(rawTitle || "", 120);
   if (!text) return "";
@@ -800,7 +816,7 @@ function trimToWordLimit(rawTitle, maxWords = 10) {
 }
 
 function normalizeAutoThreadTitle(rawTitle) {
-  const base = normalizeLowSignalTitle(rawTitle || "");
+  const base = normalizeNoisyTitle(rawTitle || "");
   if (!base) return "";
   return trimToWordLimit(base, 10);
 }
@@ -1300,6 +1316,20 @@ function isLowSignalPrompt(line) {
   return false;
 }
 
+function isCommandLikeText(line) {
+  const raw = String(line || "").trim();
+  const lower = raw.toLowerCase();
+  if (!lower) return false;
+  if (/^\s*(if|for|while|case|then|fi)\b/.test(lower)) return true;
+  if (/^\s*(echo|printf|cat|grep|sed|awk|jq|ls|cd|pwd|mkdir|rm|cp|mv|git|npm|node|bash|sh)\b/.test(lower)) return true;
+  if (/^[A-Z_][A-Z0-9_]*=/.test(raw)) return true;
+  if (lower.includes("/dev/null")) return true;
+  if (/[;&|]{1,2}/.test(raw)) return true;
+  if (raw.includes("$(") || raw.includes("${")) return true;
+  if (/(^|[\s"'`])\/home\/|(^|[\s"'`])~\//.test(raw)) return true;
+  return false;
+}
+
 function isMetaNamingPrompt(line) {
   const lower = String(line || "").trim().toLowerCase();
   if (!lower) return true;
@@ -1340,6 +1370,7 @@ function scoreCandidateLine(line) {
   let score = 0;
   if (isBoilerplateLine(line)) return -1000;
   if (isLowSignalPrompt(line)) return -60;
+  if (isCommandLikeText(line)) return -55;
   if (isMetaNamingPrompt(line)) return -35;
   if (line.length < 12 || line.length > 180) return -20;
 
@@ -1828,6 +1859,11 @@ export default function register(api) {
       const { rows } = listCliThreadIds(pluginConfig, limit);
       let updated = 0;
       let skipped = 0;
+      let cleared = 0;
+      if (parsed.force) {
+        // Force mode fully refreshes aliases so stale/manual names do not linger.
+        cleared = store.deleteSettingsByPrefix("thread_alias:");
+      }
       for (const row of rows) {
         const key = threadAliasKey(row.threadId);
         const existing = store.getSetting(key);
@@ -1846,6 +1882,7 @@ export default function register(api) {
       return {
         text: [
           `Auto naming completed.`,
+          `Cleared old aliases: ${cleared}`,
           `Updated: ${updated}`,
           `Skipped: ${skipped}`,
           `Total considered: ${rows.length}`,

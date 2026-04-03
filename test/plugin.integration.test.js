@@ -287,8 +287,15 @@ test("integration: codex_threadids discovers local codex CLI sessions", async ()
   const outAfterAuto = await commands.get("codex_threadids").handler(makeCtx());
   assert.match(outAfterAuto.text, /Investigate and fix the build failure/);
 
+  await commands
+    .get("codex_threadname")
+    .handler(makeCtx({ args: "thread-B Temporary stale alias to clear" }));
   const autoForce = await commands.get("codex_threadname_auto").handler(makeCtx({ args: "all force" }));
+  assert.match(autoForce.text, /Cleared old aliases: /);
   assert.match(autoForce.text, /Updated:/);
+
+  const outAfterForce = await commands.get("codex_threadids").handler(makeCtx());
+  assert.doesNotMatch(outAfterForce.text, /Temporary stale alias to clear/);
 });
 
 test("integration: codex_attach without args returns telegram picker buttons", async () => {
