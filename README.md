@@ -44,15 +44,7 @@ Edit `~/.openclaw/openclaw.json` and make sure you have:
     "allow": ["telegram", "codex-bridge"],
     "entries": {
       "codex-bridge": {
-        "enabled": true,
-        "config": {
-          "allowedRoots": ["/home/you/projects", "/home/you/.openclaw"],
-          "runTimeoutMs": 600000,
-          "skipGitRepoCheck": true,
-          "approval": {
-            "enabled": false
-          }
-        }
+        "enabled": true
       }
     }
   },
@@ -67,8 +59,9 @@ Edit `~/.openclaw/openclaw.json` and make sure you have:
 ```
 
 Notes:
-- `allowedRoots` should include directories you want to allow `/codex_bind` on.
 - `inlineButtons: "all"` is required for clickable `/codex_attach` picker buttons in Telegram.
+- Plugin-specific `plugins.entries.codex-bridge.config` keys can vary by OpenClaw/plugin version. Start with no custom config, then add keys only after checking:
+  `openclaw plugins info codex-bridge --json`
 
 ### 3) Restart gateway
 

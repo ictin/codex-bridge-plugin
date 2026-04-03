@@ -41,11 +41,6 @@ jq '
   .plugins.allow = (((.plugins.allow // []) + ["codex-bridge", "telegram"]) | unique) |
   .plugins.entries = (.plugins.entries // {}) |
   .plugins.entries["codex-bridge"] = ((.plugins.entries["codex-bridge"] // {}) * {"enabled": true}) |
-  .plugins.entries["codex-bridge"].config = ((.plugins.entries["codex-bridge"].config // {}) * {
-    "runTimeoutMs": 600000,
-    "skipGitRepoCheck": true,
-    "approval": {"enabled": false}
-  }) |
   .channels = (.channels // {}) |
   .channels.telegram = (.channels.telegram // {}) |
   .channels.telegram.capabilities = (
