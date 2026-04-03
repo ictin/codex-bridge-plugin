@@ -381,7 +381,7 @@ test("integration: thread auto-name prefers feature intent over smoke prompts", 
   });
 
   const out = await commands.get("codex_threadids").handler(makeCtx());
-  assert.match(out.text, /Implement Telegram session sharing Codex threads/);
+  assert.match(out.text, /Implement Telegram session sharing .*Codex threads/);
 });
 
 test("integration: codex_run sends telegram start progress when runtime sender is available", async () => {
@@ -450,7 +450,7 @@ test("integration: codex_sessions uses persistent auto-title from run history", 
 
   const sessions = await commands.get("codex_sessions").handler(makeCtx());
   assert.match(sessions.text, /thread-title-1/);
-  assert.match(sessions.text, /Implement Telegram session picker inline buttons/);
+  assert.match(sessions.text, /Implement Telegram session picker .*inline buttons/);
 });
 
 test("integration: codex_threadname_current renames bound current thread", async () => {
@@ -551,7 +551,7 @@ test("integration: semantic auto-title maps codex telegram and wealthops/news co
   await commands.get("codex_run").handler(makeCtx({ args: "new work on WealthOps bot and News bot routing" }));
 
   const sessions = await commands.get("codex_sessions").handler(makeCtx({ args: "all" }));
-  assert.match(sessions.text, /Build Codex Telegram bridge plugin session/);
+  assert.match(sessions.text, /Build Codex Telegram bridge plugin .*session/);
   assert.match(sessions.text, /WealthOps \+ News bot work/);
 });
 

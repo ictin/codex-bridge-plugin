@@ -749,7 +749,7 @@ function normalizeLowSignalTitle(rawTitle) {
   return isLowSignalPrompt(normalized) ? "Smoke/Test run" : normalized;
 }
 
-function trimToWordLimit(rawTitle, maxWords = 6) {
+function trimToWordLimit(rawTitle, maxWords = 10) {
   const text = normalizeThreadName(rawTitle || "", 120);
   if (!text) return "";
   const safe = text
@@ -802,7 +802,7 @@ function trimToWordLimit(rawTitle, maxWords = 6) {
 function normalizeAutoThreadTitle(rawTitle) {
   const base = normalizeLowSignalTitle(rawTitle || "");
   if (!base) return "";
-  return trimToWordLimit(base, 6);
+  return trimToWordLimit(base, 10);
 }
 
 function scoreTitleQuality(name) {
@@ -1452,6 +1452,25 @@ function deriveSemanticLabelFromCorpus(prompts) {
     count(/\bsignaldesk\b|\bnews\b/g) * 2 +
     count(/\bbot\b/g);
 
+  const codexFacetLabels = [];
+  if (has(/\b(session|thread|resume|reuse|attach|bind)\b|\/codex_(attach|sessions|run|bind|reset)\b/)) {
+    codexFacetLabels.push("session management");
+  }
+  if (has(/\b(name|title|rename|auto[- ]?name)\b|\/codex_thread(name|ids|name_auto)\b/)) {
+    codexFacetLabels.push("thread naming");
+  }
+  if (has(/\b(button|inline|picker|menu|tap|click)\b|\/codex_attach(?:_list)?\b/)) {
+    codexFacetLabels.push("attach picker");
+  }
+  if (has(/\b(approval|approve|policy|risky|safety|gate)\b/)) {
+    codexFacetLabels.push("approval gating");
+  }
+  if (has(/\b(route|routing|auto-route|skill)\b/)) {
+    codexFacetLabels.push("routing");
+  }
+
+  const codexFacetText = codexFacetLabels.slice(0, 2).join(" + ");
+
   if (wealthScore >= 6 && wealthScore > codexScore + 2 && hasWealthOps && hasNews && hasBot) {
     return "WealthOps + News bot work";
   }
@@ -1465,9 +1484,11 @@ function deriveSemanticLabelFromCorpus(prompts) {
     return "News bot work";
   }
   if (codexScore >= 6 && codexScore >= wealthScore && hasCodex && hasTelegram && hasPlugin && hasIntegration && hasCodexOps) {
+    if (codexFacetText) return `Codex Telegram integration plugin ${codexFacetText}`;
     return "Codex Telegram integration plugin";
   }
   if (codexScore >= 5 && codexScore >= wealthScore && hasCodex && hasTelegram && hasCodexOps) {
+    if (codexFacetText) return `Codex Telegram integration ${codexFacetText}`;
     return "Codex Telegram integration";
   }
   return "";
