@@ -231,6 +231,9 @@ class SqliteStateStore {
     this.stmtUpdateEnabled = this.db.prepare(
       `UPDATE conversation_bindings SET enabled = ?, updated_at = ? WHERE conversation_key = ?`,
     );
+    this.stmtUpdateAutoRoute = this.db.prepare(
+      `UPDATE conversation_bindings SET auto_route = ?, updated_at = ? WHERE conversation_key = ?`,
+    );
     this.stmtResetThread = this.db.prepare(
       `UPDATE conversation_bindings SET codex_thread_id = NULL, updated_at = ? WHERE conversation_key = ?`,
     );
@@ -377,6 +380,11 @@ class SqliteStateStore {
 
   setEnabled(conversationKey, enabled) {
     this.stmtUpdateEnabled.run(enabled ? 1 : 0, nowIso(), conversationKey);
+    return this.getBinding(conversationKey);
+  }
+
+  setAutoRoute(conversationKey, autoRoute) {
+    this.stmtUpdateAutoRoute.run(autoRoute ? 1 : 0, nowIso(), conversationKey);
     return this.getBinding(conversationKey);
   }
 
@@ -871,8 +879,11 @@ function resolveTelegramChatIdFromContext(ctx) {
   return null;
 }
 
-async function sendTelegramProgress(api, ctx, text) {
+async function sendTelegramSafe(api, ctx, text, asFileFallback = true) {
+  // Sends text to Telegram in safe-sized chunks. Falls back to sending as a file if
+  // content still too large or chunking fails.
   const sendMessageTelegram = api?.runtime?.channel?.telegram?.sendMessageTelegram;
+  const sendFileTelegram = api?.runtime?.channel?.telegram?.sendFileTelegram;
   if (typeof sendMessageTelegram !== "function") return;
   const chatId = resolveTelegramChatIdFromContext(ctx);
   if (!chatId) return;
@@ -891,9 +902,111 @@ async function sendTelegramProgress(api, ctx, text) {
   }
 
   try {
-    await sendMessageTelegram(chatId, text, opts);
+    const MAX = 3500; // keep below Telegram's 4096 conservative limit and account for markup
+    if (typeof text !== "string") text = String(text || "");
+    if (text.length <= MAX) {
+      await sendMessageTelegram(chatId, text, opts);
+      return;
+    }
+
+    // Try to split on paragraph / sentence / newline boundaries for cleaner chunks
+    const parts = [];
+    const paragraphs = text.split(/\n\n+/).map((p) => p.trim()).filter(Boolean);
+    for (const p of paragraphs) {
+      if (p.length <= MAX) {
+        parts.push(p);
+        continue;
+      }
+      // split long paragraph into sentences-ish pieces
+      const sentences = p.split(/[\.\!\?]\s+/).map((s) => s.trim()).filter(Boolean);
+      let buffer = "";
+      for (const s of sentences) {
+        const candidate = buffer ? `${buffer} ${s}` : s;
+        if (candidate.length > MAX) {
+          if (buffer) {
+            parts.push(buffer);
+            buffer = s;
+            if (buffer.length > MAX) {
+              // fallback split by hard chunk
+              for (let i = 0; i < buffer.length; i += MAX) {
+                parts.push(buffer.slice(i, i + MAX));
+              }
+              buffer = "";
+            }
+          } else {
+            // sentence itself too long; hard split
+            for (let i = 0; i < s.length; i += MAX) parts.push(s.slice(i, i + MAX));
+            buffer = "";
+          }
+        } else {
+          buffer = candidate;
+        }
+      }
+      if (buffer) parts.push(buffer);
+    }
+
+    // If paragraph-splitting produced nothing, fallback to fixed-size chunks
+    if (parts.length === 0) {
+      for (let i = 0; i < text.length; i += MAX) parts.push(text.slice(i, i + MAX));
+    }
+
+    // Send chunks in order, small delay to preserve ordering and avoid rate limits
+    for (let i = 0; i < parts.length; i++) {
+      const chunk = parts[i];
+      const header = parts.length > 1 ? `(part ${i + 1}/${parts.length})\n` : "";
+      try {
+        await sendMessageTelegram(chatId, `${header}${chunk}`, opts);
+        // small delay to reduce chance of Telegram 429 on bursts
+        await new Promise((r) => setTimeout(r, 120));
+      } catch (err) {
+        // If Telegram rejects due to size or other reasons, stop and try file fallback
+        if (asFileFallback && typeof sendFileTelegram === "function") {
+          try {
+            const tmp = path.join(os.tmpdir(), `codex-bridge-output-${Date.now()}.txt`);
+            fs.writeFileSync(tmp, text, "utf8");
+            await sendFileTelegram(chatId, tmp, { filename: "codex-output.txt", accountId: opts.accountId });
+            try { fs.unlinkSync(tmp); } catch {}
+            return;
+          } catch (e) {
+            // fallback failed; give up silently
+            return;
+          }
+        }
+        return;
+      }
+    }
   } catch {
-    // Best-effort only; do not fail run command on progress update failure.
+    // Best-effort only; do not throw.
+  }
+}
+
+async function sendTelegramProgress(api, ctx, text) {
+  // preserve old public API but route through safe sender
+  return await sendTelegramSafe(api, ctx, text, true);
+}
+
+// Deliver a plugin reply safely for Telegram or return the reply for non-Telegram channels.
+async function deliverCodexReplyOrReturn(api, ctx, reply) {
+  try {
+    // If reply is falsy, just return it
+    if (!reply) return reply;
+    // For Telegram, prefer normal gateway delivery for short replies.
+    // Only bypass gateway delivery for oversized text where chunk/file fallback is needed.
+    const chatId = resolveTelegramChatIdFromContext(ctx);
+    if (chatId && reply && (typeof reply.text === 'string' || typeof reply === 'string')) {
+      const text = typeof reply === 'string' ? reply : reply.text;
+      if (typeof text === "string" && text.length > 3500) {
+        await sendTelegramSafe(api, ctx, text, true);
+        // Indicate handled: return null so gateway does not try to send a duplicate reply
+        return null;
+      }
+      return typeof reply === "string" ? { text } : reply;
+    }
+    // Fallback: return the original reply object so non-Telegram channels behave unchanged
+    return reply;
+  } catch (err) {
+    // On error, fall back to returning the original reply so the gateway may attempt delivery
+    return reply;
   }
 }
 
@@ -998,20 +1111,23 @@ function parseThreadNameArgs(rawArgs) {
 
 function parseThreadNameAutoArgs(rawArgs) {
   const input = String(rawArgs || "").trim();
-  if (!input) return { limit: 30, force: false };
+  if (!input) return { limit: 30, force: false, useLlm: false };
 
   const force = /\bforce\b/i.test(input);
-  const cleaned = input.replace(/\bforce\b/gi, "").trim();
+  const llm = /\bllm\b/i.test(input);
+  const heuristic = /\bheuristic\b/i.test(input);
+  const useLlm = heuristic ? false : llm;
+  const cleaned = input.replace(/\b(force|llm|heuristic)\b/gi, "").trim();
   if (!cleaned || cleaned.toLowerCase() === "all") {
-    return { limit: 200, force };
+    return { limit: 200, force, useLlm };
   }
   const limitMatch = cleaned.match(/^limit\s+(\d+)$/i);
   if (limitMatch) {
-    return { limit: Number.parseInt(limitMatch[1], 10), force };
+    return { limit: Number.parseInt(limitMatch[1], 10), force, useLlm };
   }
   const numeric = Number.parseInt(cleaned, 10);
   if (Number.isFinite(numeric) && String(numeric) === cleaned) {
-    return { limit: numeric, force };
+    return { limit: numeric, force, useLlm };
   }
   return { invalid: true };
 }
@@ -1137,6 +1253,7 @@ function listCliThreadIds(pluginConfig, limit = 20) {
       lastUpdatedAt: row.lastUpdatedMs ? new Date(row.lastUpdatedMs).toISOString() : row.timestamp,
       lastUpdatedMs: row.lastUpdatedMs || 0,
       cwd: row.cwd,
+      files: row.files.slice(),
       defaultName,
       file: row.files[0],
     });
@@ -1317,6 +1434,127 @@ function extractMessageTextsFromSession(filePath, role = "user") {
     }
   }
   return texts;
+}
+
+function extractConversationTurnsFromSession(filePath) {
+  const records = parseJsonl(filePath);
+  const turns = [];
+  for (const rec of records) {
+    if (rec?.type !== "response_item") continue;
+    const payload = rec?.payload;
+    const role = payload?.role;
+    if (!payload || (role !== "user" && role !== "assistant") || !Array.isArray(payload.content)) continue;
+    const textParts = [];
+    for (const part of payload.content) {
+      if (!part || typeof part !== "object") continue;
+      const maybeText =
+        (part.type === "input_text" && typeof part.text === "string" && part.text) ||
+        (part.type === "output_text" && typeof part.text === "string" && part.text) ||
+        (part.type === "text" && typeof part.text === "string" && part.text) ||
+        (typeof part.text === "string" && part.text);
+      if (!maybeText) continue;
+      textParts.push(String(maybeText));
+    }
+    const joined = textParts.join("\n").trim();
+    if (!joined) continue;
+    turns.push({ role, text: joined });
+  }
+  return turns;
+}
+
+function buildThreadTranscriptForNaming(filePaths, maxChars = 14000) {
+  const files = Array.isArray(filePaths) ? filePaths : [];
+  const turns = files
+    .flatMap((file) => extractConversationTurnsFromSession(file))
+    .map((turn) => ({
+      role: turn.role,
+      text: String(turn.text || "")
+        .replace(/\r/g, "")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line && !isBoilerplateLine(line))
+        .join(" "),
+    }))
+    .filter((turn) => turn.text);
+
+  const compact = turns
+    .map((turn) => `${turn.role}: ${turn.text}`)
+    .join("\n")
+    .trim();
+  if (!compact) return "";
+  return compact.length > maxChars ? compact.slice(0, maxChars) : compact;
+}
+
+function normalizeGeneratedTitle(rawTitle, maxWords = 6) {
+  const text = String(rawTitle || "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/["'`]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "";
+  const words = text.split(" ").filter(Boolean).slice(0, maxWords);
+  if (words.length === 0) return "";
+  return words.join(" ");
+}
+
+async function generateThreadTitleWithLlm({
+  transcript,
+  cwd,
+  threadId,
+  model = "gpt-5-mini",
+  timeoutMs = 20000,
+  apiKey,
+  baseUrl = "https://api.openai.com",
+}) {
+  if (!apiKey || !transcript) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(5000, timeoutMs));
+  try {
+    const prompt = [
+      "Generate a concise title for this coding conversation.",
+      "Requirements:",
+      "- Output ONLY the title text.",
+      "- Maximum 6 words.",
+      "- Must summarize the implemented feature/work, not generic maintenance wording.",
+      "- Avoid code snippets, file paths, and shell commands in title.",
+      "",
+      `Thread ID: ${threadId}`,
+      `Workspace: ${cwd || "unknown"}`,
+      "",
+      "Conversation:",
+      transcript,
+    ].join("\n");
+
+    const response = await fetch(`${String(baseUrl).replace(/\/+$/, "")}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${apiKey}`,
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        input: prompt,
+        max_output_tokens: 48,
+      }),
+    });
+    if (!response.ok) return null;
+    const json = await response.json();
+    const outputText =
+      (typeof json?.output_text === "string" && json.output_text) ||
+      (Array.isArray(json?.output) &&
+        json.output
+          .flatMap((item) => (Array.isArray(item?.content) ? item.content : []))
+          .map((part) => (typeof part?.text === "string" ? part.text : ""))
+          .join(" ")) ||
+      "";
+    const normalized = normalizeGeneratedTitle(outputText, 6);
+    return normalized || null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function splitCandidateLines(text) {
@@ -1726,6 +1964,50 @@ function threadAutoTitleKey(threadId) {
   return `thread_auto_title:${threadId}`;
 }
 
+function draftPromptKey(conversationKey) {
+  return `draft_prompt:${conversationKey}`;
+}
+
+function loadDraftPrompt(store, conversationKey) {
+  const raw = store.getSetting(draftPromptKey(conversationKey));
+  if (!raw) return { parts: [], updatedAt: null };
+  try {
+    const parsed = JSON.parse(String(raw));
+    const parts = Array.isArray(parsed?.parts) ? parsed.parts.map((p) => String(p || "")).filter(Boolean) : [];
+    return {
+      parts,
+      updatedAt: parsed?.updatedAt || null,
+    };
+  } catch {
+    return { parts: [], updatedAt: null };
+  }
+}
+
+function saveDraftPrompt(store, conversationKey, draft) {
+  const payload = {
+    parts: Array.isArray(draft?.parts) ? draft.parts.map((p) => String(p || "")).filter(Boolean) : [],
+    updatedAt: nowIso(),
+  };
+  store.setSetting(draftPromptKey(conversationKey), JSON.stringify(payload));
+  return payload;
+}
+
+function clearDraftPrompt(store, conversationKey) {
+  store.deleteSetting(draftPromptKey(conversationKey));
+}
+
+function formatDraftSummary(draft) {
+  const parts = Array.isArray(draft?.parts) ? draft.parts : [];
+  const combined = parts.join("\n\n").trim();
+  const chars = combined.length;
+  const preview = combined.length > 600 ? `${combined.slice(0, 600)}\n\n[truncated]` : combined;
+  return {
+    chars,
+    partsCount: parts.length,
+    preview: preview || "(empty)",
+  };
+}
+
 function shortenThreadId(threadId, maxChars = 16) {
   const text = String(threadId || "").trim();
   if (!text) return "";
@@ -1931,7 +2213,7 @@ export default function register(api) {
     acceptsArgs: true,
     handler: async (ctx) => {
       const rawPath = String(ctx.args || "").trim();
-      if (!rawPath) return { text: "Usage: /codex_bind <absolute-path>" };
+      if (!rawPath) return await deliverCodexReplyOrReturn(api, ctx, { text: "Usage: /codex_bind <absolute-path>" });
 
       const repoCwd = ensureAbsoluteExistingDirectory(rawPath);
       assertAllowedRoot(repoCwd, pluginConfig);
@@ -1979,7 +2261,10 @@ export default function register(api) {
             "/codex_threadname_auto",
             "/codex_threadname_auto all",
             "/codex_threadname_auto 50",
+            "/codex_threadname_auto all llm",
             "/codex_threadname_auto all force",
+            "/codex_threadname_auto all force llm",
+            "/codex_threadname_auto all force heuristic",
             "/codex_threadname_auto limit 100 force",
           ].join("\n"),
         };
@@ -1990,6 +2275,8 @@ export default function register(api) {
       let updated = 0;
       let skipped = 0;
       let cleared = 0;
+      let llmUsed = 0;
+      let llmFallback = 0;
       if (parsed.force) {
         // Force mode fully refreshes aliases so stale/manual names do not linger.
         cleared = store.deleteSettingsByPrefix("thread_alias:");
@@ -2001,7 +2288,25 @@ export default function register(api) {
           skipped += 1;
           continue;
         }
-        const candidate = normalizeThreadName(row.defaultName || "Unnamed session");
+        let candidate = normalizeThreadName(row.defaultName || "Unnamed session");
+        if (parsed.useLlm) {
+          const transcript = buildThreadTranscriptForNaming(row.files || [], 14000);
+          const generated = await generateThreadTitleWithLlm({
+            transcript,
+            cwd: row.cwd,
+            threadId: row.threadId,
+            model: String(pluginConfig?.threadNamingModel || "gpt-5-mini"),
+            timeoutMs: Number(pluginConfig?.threadNamingTimeoutMs || 20000),
+            apiKey: process.env.OPENAI_API_KEY || process.env.CODEX_API_KEY || "",
+            baseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com",
+          });
+          if (generated) {
+            candidate = normalizeThreadName(generated);
+            llmUsed += 1;
+          } else {
+            llmFallback += 1;
+          }
+        }
         if (!candidate || candidate === "Unnamed session") {
           skipped += 1;
           continue;
@@ -2016,6 +2321,8 @@ export default function register(api) {
           `Updated: ${updated}`,
           `Skipped: ${skipped}`,
           `Total considered: ${rows.length}`,
+          `LLM titles used: ${llmUsed}`,
+          `LLM fallback used: ${llmFallback}`,
           "",
           "See results with: /codex_threadids",
         ].join("\n"),
@@ -2029,7 +2336,8 @@ export default function register(api) {
     handler: async (ctx) => {
       const store = await getStore();
       const conversationKey = buildConversationKey(ctx);
-      return { text: formatStatus(store.getBinding(conversationKey), conversationKey) };
+      const reply = { text: formatStatus(store.getBinding(conversationKey), conversationKey) };
+      return await deliverCodexReplyOrReturn(api, ctx, reply);
     },
   });
 
@@ -2040,10 +2348,10 @@ export default function register(api) {
       const store = await getStore();
       const conversationKey = buildConversationKey(ctx);
       if (!store.getBinding(conversationKey)) {
-        return { text: "No binding found for this conversation." };
+        return await deliverCodexReplyOrReturn(api, ctx, { text: "No binding found for this conversation." });
       }
       store.resetThread(conversationKey);
-      return { text: "Codex thread reset. Repo binding is preserved." };
+      return await deliverCodexReplyOrReturn(api, ctx, { text: "Codex thread reset. Repo binding is preserved." });
     },
   });
 
@@ -2054,8 +2362,8 @@ export default function register(api) {
       const store = await getStore();
       const conversationKey = buildConversationKey(ctx);
       const removed = store.unbind(conversationKey);
-      if (!removed) return { text: "No binding found for this conversation." };
-      return { text: "Codex binding removed for this conversation." };
+      if (!removed) return await deliverCodexReplyOrReturn(api, ctx, { text: "No binding found for this conversation." });
+      return await deliverCodexReplyOrReturn(api, ctx, { text: "Codex binding removed for this conversation." });
     },
   });
 
@@ -2066,10 +2374,10 @@ export default function register(api) {
       const store = await getStore();
       const conversationKey = buildConversationKey(ctx);
       if (!store.getBinding(conversationKey)) {
-        return { text: "No binding found. Run /codex_bind <absolute-path> first." };
+        return await deliverCodexReplyOrReturn(api, ctx, { text: "No binding found. Run /codex_bind <absolute-path> first." });
       }
       store.setEnabled(conversationKey, true);
-      return { text: "Codex mode enabled for this conversation." };
+      return await deliverCodexReplyOrReturn(api, ctx, { text: "Codex mode enabled for this conversation." });
     },
   });
 
@@ -2080,10 +2388,52 @@ export default function register(api) {
       const store = await getStore();
       const conversationKey = buildConversationKey(ctx);
       if (!store.getBinding(conversationKey)) {
-        return { text: "No binding found. Run /codex_bind <absolute-path> first." };
+        return await deliverCodexReplyOrReturn(api, ctx, { text: "No binding found. Run /codex_bind <absolute-path> first." });
       }
       store.setEnabled(conversationKey, false);
-      return { text: "Codex mode disabled for this conversation." };
+      return await deliverCodexReplyOrReturn(api, ctx, { text: "Codex mode disabled for this conversation." });
+    },
+  });
+
+  api.registerCommand({
+    name: "codex_start",
+    description: "Soft-enable Codex routing for regular messages in this conversation",
+    handler: async (ctx) => {
+      const store = await getStore();
+      const conversationKey = buildConversationKey(ctx);
+      if (!store.getBinding(conversationKey)) {
+        return await deliverCodexReplyOrReturn(api, ctx, { text: "No binding found. Run /codex_bind <absolute-path> first." });
+      }
+      store.setEnabled(conversationKey, true);
+      store.setAutoRoute(conversationKey, true);
+      return await deliverCodexReplyOrReturn(api, ctx, {
+        text: [
+          "Codex soft mode enabled.",
+          "Auto-route: on",
+          "Note: this is preference-based routing, not a hard override.",
+          "Use /codex_run for explicit execution.",
+        ].join("\n"),
+      });
+    },
+  });
+
+  api.registerCommand({
+    name: "codex_stop",
+    description: "Disable soft auto-routing for regular messages in this conversation",
+    handler: async (ctx) => {
+      const store = await getStore();
+      const conversationKey = buildConversationKey(ctx);
+      if (!store.getBinding(conversationKey)) {
+        return await deliverCodexReplyOrReturn(api, ctx, { text: "No binding found. Run /codex_bind <absolute-path> first." });
+      }
+      store.setAutoRoute(conversationKey, false);
+      return await deliverCodexReplyOrReturn(api, ctx, {
+        text: [
+          "Codex soft mode disabled.",
+          "Auto-route: off",
+          "Explicit runs still work: /codex_run <task>",
+        ].join("\n"),
+      });
     },
   });
 
@@ -2093,15 +2443,15 @@ export default function register(api) {
     acceptsArgs: true,
     handler: async (ctx) => {
       const model = String(ctx.args || "").trim();
-      if (!model) return { text: "Usage: /codex_model <model>" };
+      if (!model) return await deliverCodexReplyOrReturn(api, ctx, { text: "Usage: /codex_model <model>" });
 
       const store = await getStore();
       const conversationKey = buildConversationKey(ctx);
       if (!store.getBinding(conversationKey)) {
-        return { text: "No binding found. Run /codex_bind <absolute-path> first." };
+        return await deliverCodexReplyOrReturn(api, ctx, { text: "No binding found. Run /codex_bind <absolute-path> first." });
       }
       store.setModel(conversationKey, model);
-      return { text: `Model set for this conversation: ${model}` };
+      return await deliverCodexReplyOrReturn(api, ctx, { text: `Model set for this conversation: ${model}` });
     },
   });
 
@@ -2138,10 +2488,10 @@ export default function register(api) {
       }
 
       if (!binding) {
-        return { text: "No binding found. Run /codex_bind <absolute-path> first." };
+        return await deliverCodexReplyOrReturn(api, ctx, { text: "No binding found. Run /codex_bind <absolute-path> first." });
       }
       store.attachThread(conversationKey, threadId);
-      return { text: `Attached conversation to thread: ${threadId}` };
+      return await deliverCodexReplyOrReturn(api, ctx, { text: `Attached conversation to thread: ${threadId}` });
     },
   });
 
@@ -2173,11 +2523,11 @@ export default function register(api) {
       const store = await getStore();
       const parsed = parseThreadIdsArgs(ctx.args);
       if (parsed.invalid) {
-        return {
+        return await deliverCodexReplyOrReturn(api, ctx, {
           text: ["Usage:", "/codex_threadids", "/codex_threadids 30", "/codex_threadids limit 50"].join(
             "\n",
           ),
-        };
+        });
       }
 
       const limit = Math.max(1, Math.min(200, parsed.limit || 20));
@@ -2201,7 +2551,7 @@ export default function register(api) {
       lines.push("");
       lines.push("Attach one: /codex_attach <threadId>");
       lines.push("Rename: /codex_threadname <threadId> <name>");
-      return { text: lines.join("\n") };
+      return await deliverCodexReplyOrReturn(api, ctx, { text: lines.join("\n") });
     },
   });
 
@@ -2225,17 +2575,17 @@ export default function register(api) {
       const { threadId } = parsed;
       const desired = normalizeThreadName(parsed.name);
       if (!desired) {
-        return { text: "Name cannot be empty." };
+        return await deliverCodexReplyOrReturn(api, ctx, { text: "Name cannot be empty." });
       }
 
       const key = threadAliasKey(threadId);
       if (desired.toLowerCase() === "default" || desired.toLowerCase() === "reset") {
         store.deleteSetting(key);
-        return { text: `Thread name reset to default preview for: ${threadId}` };
+        return await deliverCodexReplyOrReturn(api, ctx, { text: `Thread name reset to default preview for: ${threadId}` });
       }
 
       store.setSetting(key, desired);
-      return { text: `Thread name updated for ${threadId}: ${desired}` };
+      return await deliverCodexReplyOrReturn(api, ctx, { text: `Thread name updated for ${threadId}: ${desired}` });
     },
   });
 
@@ -2246,17 +2596,17 @@ export default function register(api) {
     handler: async (ctx) => {
       const desired = normalizeThreadName(String(ctx.args || ""));
       if (!desired) {
-        return { text: "Usage: /codex_threadname_current <name>" };
+        return await deliverCodexReplyOrReturn(api, ctx, { text: "Usage: /codex_threadname_current <name>" });
       }
 
       const store = await getStore();
       const conversationKey = buildConversationKey(ctx);
       const binding = store.getBinding(conversationKey);
       if (!binding) {
-        return { text: "No binding found. Run /codex_bind <absolute-path> first." };
+        return await deliverCodexReplyOrReturn(api, ctx, { text: "No binding found. Run /codex_bind <absolute-path> first." });
       }
       if (!binding.codex_thread_id) {
-        return { text: "No current thread attached in this conversation." };
+        return await deliverCodexReplyOrReturn(api, ctx, { text: "No current thread attached in this conversation." });
       }
 
       const threadId = String(binding.codex_thread_id);
@@ -2268,13 +2618,13 @@ export default function register(api) {
           normalizeLowSignalTitle(row?.defaultName || "Unnamed session");
         if (auto) {
           store.setSetting(threadAutoTitleKey(threadId), auto);
-          return { text: `Auto title recomputed for current thread ${threadId}: ${auto}` };
+          return await deliverCodexReplyOrReturn(api, ctx, { text: `Auto title recomputed for current thread ${threadId}: ${auto}` });
         }
-        return { text: `No auto title could be computed for current thread ${threadId}.` };
+        return await deliverCodexReplyOrReturn(api, ctx, { text: `No auto title could be computed for current thread ${threadId}.` });
       }
 
       store.setSetting(threadAliasKey(threadId), desired);
-      return { text: `Thread name updated for current thread ${threadId}: ${desired}` };
+      return await deliverCodexReplyOrReturn(api, ctx, { text: `Thread name updated for current thread ${threadId}: ${desired}` });
     },
   });
 
@@ -2414,7 +2764,7 @@ export default function register(api) {
       lines.push("Run new: /codex_run new <task>");
       lines.push("Run on existing: /codex_run use <threadId> <task>");
       lines.push("More: /codex_sessions page <n>  |  /codex_sessions all  |  /codex_sessions global");
-      return { text: lines.join("\n") };
+      return await deliverCodexReplyOrReturn(api, ctx, { text: lines.join("\n") });
     },
   });
 
@@ -2469,6 +2819,175 @@ export default function register(api) {
         const code = err?.code || "RUN_FAILED";
         const message = err?.message || String(err);
         return { text: `Codex run ${runId} failed (${code}): ${message}` };
+      }
+    },
+  });
+
+  api.registerCommand({
+    name: "codex_draft_start",
+    description: "Start or replace a multi-message draft prompt for this conversation",
+    acceptsArgs: true,
+    handler: async (ctx) => {
+      const firstPart = String(ctx.args || "").trim();
+      if (!firstPart) {
+        return { text: "Usage: /codex_draft_start <text>" };
+      }
+      const store = await getStore();
+      const conversationKey = buildConversationKey(ctx);
+      const saved = saveDraftPrompt(store, conversationKey, { parts: [firstPart] });
+      const summary = formatDraftSummary(saved);
+      return {
+        text: [
+          "Draft prompt started.",
+          `Parts: ${summary.partsCount}`,
+          `Chars: ${summary.chars}`,
+          "Add more: /codex_draft_add <text>",
+          "Inspect: /codex_draft_show",
+          "Send: /codex_draft_send",
+        ].join("\n"),
+      };
+    },
+  });
+
+  api.registerCommand({
+    name: "codex_draft_add",
+    description: "Append text to the current multi-message draft prompt",
+    acceptsArgs: true,
+    handler: async (ctx) => {
+      const part = String(ctx.args || "").trim();
+      if (!part) return { text: "Usage: /codex_draft_add <text>" };
+
+      const store = await getStore();
+      const conversationKey = buildConversationKey(ctx);
+      const current = loadDraftPrompt(store, conversationKey);
+      if (!current.parts.length) {
+        return { text: "No draft found. Start one with /codex_draft_start <text>." };
+      }
+      current.parts.push(part);
+      const saved = saveDraftPrompt(store, conversationKey, current);
+      const summary = formatDraftSummary(saved);
+      return {
+        text: [
+          "Draft prompt updated.",
+          `Parts: ${summary.partsCount}`,
+          `Chars: ${summary.chars}`,
+          "Inspect: /codex_draft_show",
+          "Send: /codex_draft_send",
+        ].join("\n"),
+      };
+    },
+  });
+
+  api.registerCommand({
+    name: "codex_draft_show",
+    description: "Show current multi-message draft prompt summary",
+    handler: async (ctx) => {
+      const store = await getStore();
+      const conversationKey = buildConversationKey(ctx);
+      const current = loadDraftPrompt(store, conversationKey);
+      if (!current.parts.length) {
+        return {
+          text: [
+            "No draft prompt for this conversation.",
+            "Start: /codex_draft_start <text>",
+          ].join("\n"),
+        };
+      }
+      const summary = formatDraftSummary(current);
+      return {
+        text: [
+          "Draft prompt summary:",
+          `Parts: ${summary.partsCount}`,
+          `Chars: ${summary.chars}`,
+          "",
+          summary.preview,
+          "",
+          "Send: /codex_draft_send",
+        ].join("\n"),
+      };
+    },
+  });
+
+  api.registerCommand({
+    name: "codex_draft_clear",
+    description: "Clear current multi-message draft prompt",
+    handler: async (ctx) => {
+      const store = await getStore();
+      const conversationKey = buildConversationKey(ctx);
+      clearDraftPrompt(store, conversationKey);
+      return { text: "Draft prompt cleared." };
+    },
+  });
+
+  api.registerCommand({
+    name: "codex_draft_send",
+    description: "Run the assembled draft prompt through Codex",
+    acceptsArgs: true,
+    handler: async (ctx) => {
+      const parsed = parseRunArgs(ctx.args);
+      if (parsed.mode === "use" && !String(parsed.threadId || "").trim()) {
+        return { text: "Usage: /codex_draft_send use <threadId>" };
+      }
+      if (parsed.prompt) {
+        return {
+          text: [
+            "Usage:",
+            "/codex_draft_send",
+            "/codex_draft_send new",
+            "/codex_draft_send use <threadId>",
+            "",
+            "Draft content must come from /codex_draft_start and /codex_draft_add.",
+          ].join("\n"),
+        };
+      }
+
+      const store = await getStore();
+      const conversationKey = buildConversationKey(ctx);
+      const draft = loadDraftPrompt(store, conversationKey);
+      const prompt = draft.parts.join("\n\n").trim();
+      if (!prompt) {
+        return {
+          text: [
+            "No draft prompt to send.",
+            "Start: /codex_draft_start <text>",
+          ].join("\n"),
+        };
+      }
+
+      const summary = formatDraftSummary(draft);
+      const runId = crypto.randomUUID().slice(0, 8);
+      await sendTelegramProgress(
+        api,
+        ctx,
+        `⏳ Codex draft run started (${runId})\nMode: ${parsed.mode}\nParts: ${summary.partsCount} | Chars: ${summary.chars}`,
+      );
+
+      let lastProgressAt = 0;
+      const minProgressIntervalMs = 2500;
+      try {
+        const result = await executeCodexRun({
+          conversationKey,
+          prompt,
+          createIfMissing: true,
+          requireBoundRepo: true,
+          forceNewThread: parsed.mode === "new",
+          threadIdOverride: parsed.mode === "use" ? parsed.threadId : null,
+          onProgress: async (text) => {
+            const now = Date.now();
+            if (!text) return;
+            if (now - lastProgressAt < minProgressIntervalMs && !/completed|failed/i.test(text)) return;
+            lastProgressAt = now;
+            await sendTelegramProgress(api, ctx, `⏱ ${text} (${runId})`);
+          },
+        });
+        clearDraftPrompt(store, conversationKey);
+        return { text: `run: ${runId}\n${summarizeRunForReply(result)}\n\ndraft: cleared` };
+      } catch (err) {
+        const code = err?.code || "RUN_FAILED";
+        const message = err?.message || String(err);
+        return {
+          text: `Codex draft run ${runId} failed (${code}): ${message}\nDraft preserved: yes`,
+        };
       }
     },
   });
